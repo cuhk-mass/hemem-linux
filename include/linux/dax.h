@@ -7,6 +7,9 @@
 #include <linux/radix-tree.h>
 #include <asm/pgtable.h>
 
+/* Flag for synchronous flush */
+#define DAXDEV_F_SYNC (1UL << 0)
+
 typedef unsigned long dax_entry_t;
 
 struct iomap_ops;
@@ -32,18 +35,20 @@ extern struct attribute_group dax_attribute_group;
 #if IS_ENABLED(CONFIG_DAX)
 struct dax_device *dax_get_by_host(const char *host);
 struct dax_device *alloc_dax(void *private, const char *host,
-		const struct dax_operations *ops);
+		const struct dax_operations *ops, unsigned long flags);
 void put_dax(struct dax_device *dax_dev);
 void kill_dax(struct dax_device *dax_dev);
 void dax_write_cache(struct dax_device *dax_dev, bool wc);
 bool dax_write_cache_enabled(struct dax_device *dax_dev);
+bool dax_synchronous(struct dax_device *dax_dev);
+void set_dax_synchronous(struct dax_device *dax_dev);
 #else
 static inline struct dax_device *dax_get_by_host(const char *host)
 {
 	return NULL;
 }
 static inline struct dax_device *alloc_dax(void *private, const char *host,
-		const struct dax_operations *ops)
+		const struct dax_operations *ops, unsigned long flags)
 {
 	/*
 	 * Callers should check IS_ENABLED(CONFIG_DAX) to know if this
