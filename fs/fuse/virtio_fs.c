@@ -529,7 +529,7 @@ static int virtio_fs_setup_dax(struct virtio_device *vdev, struct virtio_fs *fs)
 					   (u8)VIRTIO_FS_SHMCAP_ID_CACHE);
 	if (!have_cache) {
 		dev_err(&vdev->dev, "%s: No cache capability\n", __func__);
-		return -ENXIO;
+		return 0;
 	} else {
 		dev_notice(&vdev->dev, "Cache len: 0x%llx @ 0x%llx\n",
 			   cache_reg.len, cache_reg.addr);
