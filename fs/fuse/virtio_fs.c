@@ -582,7 +582,7 @@ static int virtio_fs_setup_dax(struct virtio_device *vdev, struct virtio_fs *fs)
 		" len 0x%llx\n", __func__, fs->window_kaddr, cache_reg.addr,
 		cache_reg.len);
 
-	fs->dax_dev = alloc_dax(fs, NULL, &virtio_fs_dax_ops);
+	fs->dax_dev = alloc_dax(fs, NULL, &virtio_fs_dax_ops, 0);
 	if (!fs->dax_dev)
 		return -ENOMEM;
 
