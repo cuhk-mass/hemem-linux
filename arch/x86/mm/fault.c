@@ -442,7 +442,7 @@ static int bad_address(void *p)
 	return probe_kernel_address((unsigned long *)p, dummy);
 }
 
-static void dump_pagetable(unsigned long address)
+void dump_pagetable(unsigned long address)
 {
 	pgd_t *base = __va(read_cr3_pa());
 	pgd_t *pgd = base + pgd_index(address);
@@ -454,7 +454,7 @@ static void dump_pagetable(unsigned long address)
 	if (bad_address(pgd))
 		goto bad;
 
-	pr_info("PGD %lx ", pgd_val(*pgd));
+	pr_info("PGD %016lx ", pgd_val(*pgd));
 
 	if (!pgd_present(*pgd))
 		goto out;
@@ -494,6 +494,7 @@ out:
 bad:
 	pr_info("BAD\n");
 }
+EXPORT_SYMBOL(dump_pagetable);
 
 #endif /* CONFIG_X86_64 */
 

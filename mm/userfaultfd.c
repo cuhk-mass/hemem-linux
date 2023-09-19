@@ -18,7 +18,33 @@
 #include <linux/hugetlb.h>
 #include <linux/shmem_fs.h>
 #include <asm/tlbflush.h>
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/device.h>
+#include <linux/cdev.h>
+#include <linux/wait.h>
+#include <linux/string.h>
+#include <linux/dma-mapping.h>
+#include <linux/slab.h>
+#include <linux/dmaengine.h>
 #include "internal.h"
+#include <linux/delay.h>
+#include <linux/pci.h>
+#include <asm/pgtable.h>
+#include <linux/mutex.h>
+
+static DECLARE_WAIT_QUEUE_HEAD(wq);
+//For simplicity, request/release a fixed number of channs
+struct dma_chan *chans[MAX_DMA_CHANS] = {NULL};
+#define MAX_SIZE_PER_DMA_REQUEST (2*1024*1024)
+u32 size_per_dma_request =  MAX_SIZE_PER_DMA_REQUEST;
+u32 dma_channs = 0;
+
+struct tx_dma_param {
+    struct mutex tx_dma_mutex;
+	u64 expect_count;
+	volatile u64 wakeup_count;
+};
 
 /*
  * Find a valid userfault enabled VMA region that covers the whole
@@ -31,19 +57,29 @@ static struct vm_area_struct *vma_find_uffd(struct mm_struct *mm,
 {
 	struct vm_area_struct *vma = find_vma(mm, start);
 
-	if (!vma)
+	if (!vma) {
+		printk("mm/userfaultfd.c: vma_find_uffd: !vma\n");
 		return NULL;
+	}
 
-	/*
+//	printk("mm/userfaultfd.c: vma_find_uffd: start: 0x%lx\tlen: %ld\n", start, len);
+//  printk("mm/userfaultfd.c: vma_find_uffd: found vma 0x%p: 0x%lx - 0x%lx\tlen: %ld\n", vma, vma->vm_start, vma->vm_end, (vma->vm_end - vma->vm_start));
+  /*
 	 * Check the vma is registered in uffd, this is required to
 	 * enforce the VM_MAYWRITE check done at uffd registration
 	 * time.
 	 */
-	if (!vma->vm_userfaultfd_ctx.ctx)
+	if (!vma->vm_userfaultfd_ctx.ctx) {
+		printk("mm/userfaultfd.c: vma_find_uffd: !vma->vm_userfaultfd_ctx.ctx\n");
 		return NULL;
+	}
 
-	if (start < vma->vm_start || start + len > vma->vm_end)
+	if (start < vma->vm_start || start + len > vma->vm_end) {
+		printk("mm/userfaultfd.c: vma_find_uffd: region out of vma range\n");
+	  printk("mm/userfaultfd.c: vma_find_uffd: start: 0x%lx\tlen: %ld\n", start, len);
+    printk("mm/userfaultfd.c: vma_find_uffd: found vma 0x%p: 0x%lx - 0x%lx\tlen: %ld\n", vma, vma->vm_start, vma->vm_end, (vma->vm_end - vma->vm_start));
 		return NULL;
+	}
 
 	return vma;
 }
@@ -102,8 +138,10 @@ static int mcopy_atomic_pte(struct mm_struct *dst_mm,
 
 	_dst_pte = pte_mkdirty(mk_pte(page, dst_vma->vm_page_prot));
 	if (dst_vma->vm_flags & VM_WRITE) {
-		if (wp_copy)
+		if (wp_copy) {
+			printk("mm/userfaultfd.c: mcopy_atomic_pte: wp_copy pte_mkuffd_wp\n");
 			_dst_pte = pte_mkuffd_wp(_dst_pte);
+		}
 		else
 			_dst_pte = pte_mkwrite(_dst_pte);
 	}
@@ -626,12 +664,317 @@ out:
 	return copied ? copied : err;
 }
 
+static void hemem_dma_tx_callback(void *dma_async_param)
+{
+	struct tx_dma_param *tx_dma_param = (struct tx_dma_param*)dma_async_param;
+    struct mutex *tx_dma_mutex = &(tx_dma_param->tx_dma_mutex);
+    mutex_lock(tx_dma_mutex);
+	(tx_dma_param->wakeup_count)++;
+	if (tx_dma_param->wakeup_count < tx_dma_param->expect_count) {
+        mutex_unlock(tx_dma_mutex);
+		return;
+	}
+    mutex_unlock(tx_dma_mutex);
+	wake_up_interruptible(&wq);
+}
+
+static int bad_address(void *p)
+{
+	unsigned long dummy;
+
+	return probe_kernel_address((unsigned long *)p, dummy);
+}
+
+static void  page_walk(u64 address, u64* phy_addr)
+{
+
+	pgd_t *base = __va(read_cr3_pa());
+	pgd_t *pgd = base + pgd_index(address);
+        p4d_t *p4d;
+        pud_t *pud;
+        pmd_t *pmd;
+        pte_t *pte;
+	u64 page_addr;
+	u64 page_offset;
+ 	int present = 0;	
+	int write = 0;
+
+	if (bad_address(pgd))
+		goto out;
+
+	if (!pgd_present(*pgd))
+		goto out;
+
+	p4d = p4d_offset(pgd, address);
+	if (bad_address(p4d))
+		goto out;
+
+	if (!p4d_present(*p4d) || p4d_large(*p4d))
+		goto out;
+
+	pud = pud_offset(p4d, address);
+	if (bad_address(pud))
+		goto out;
+
+	if (!pud_present(*pud) || pud_large(*pud))
+		goto out;
+
+	pmd = pmd_offset(pud, address);
+	if (bad_address(pmd))
+		goto out;
+
+    if (pmd_large(*pmd)) {
+	    page_addr = pmd_val(*pmd) & 0x000FFFFFFFE00000;
+	    page_offset = address & ~HPAGE_MASK;
+    }
+    else {
+        if (!pmd_present(*pmd))
+            goto out;
+
+        pte = pte_offset_kernel(pmd, address);
+        if (bad_address(pte))
+            goto out;
+
+        present = pte_present(*pte);
+        write = pte_write(*pte);
+        
+        if (present != 1 || write == 0) {
+            printk("in page_walk, address=%llu, present=%d, write=%d\n", address, present, write); 
+        }
+
+        page_addr = pte_val(*pte) & 0x000FFFFFFFFFF000;
+        page_offset = address & ~PAGE_MASK;
+    }
+
+	*phy_addr = page_addr | page_offset;
+    return;
+
+out:
+	pr_info("BAD\n");
+}
+
+int dma_request_channs(struct uffdio_dma_channs* uffdio_dma_channs)
+{
+    struct dma_chan *chan = NULL;
+    dma_cap_mask_t mask;
+    int index;
+    int num_channs;
+
+    if (uffdio_dma_channs == NULL) {
+        return -1;
+    }
+
+    num_channs = uffdio_dma_channs->num_channs;
+    if (num_channs > MAX_DMA_CHANS) {
+        num_channs = MAX_DMA_CHANS;
+    }
+
+    size_per_dma_request = uffdio_dma_channs->size_per_dma_request;
+    if (size_per_dma_request > MAX_SIZE_PER_DMA_REQUEST) {
+        size_per_dma_request = MAX_SIZE_PER_DMA_REQUEST;
+    }
+
+    dma_cap_zero(mask);
+    dma_cap_set(DMA_MEMCPY, mask);
+    for (index = 0; index < num_channs; index++) {
+        if (chans[index]) {
+            continue;
+        }
+
+        chan = dma_request_channel(mask, NULL, NULL);
+        if (chan == NULL) {
+            printk("wei: error when dma_request_channel, index=%d, num_channs=%u\n", index, num_channs);
+            goto out;
+        }
+
+        chans[index] = chan;
+    }
+
+    dma_channs = num_channs;
+    return 0;
+out:
+    while (index >= 0) {
+        if (chans[index]) {
+            dma_release_channel(chans[index]);
+            chans[index] = NULL;
+        }
+    }
+
+    return -1;
+}
+
+int dma_release_channs(void)
+{
+    int index;
+
+    for (index = 0; index < dma_channs; index++) {
+        if (chans[index]) {
+            dma_release_channel(chans[index]);
+            chans[index] = NULL;
+        }
+    }
+
+    dma_channs = 0;
+    size_per_dma_request = MAX_SIZE_PER_DMA_REQUEST;
+    return 0;
+}
+
+static __always_inline ssize_t __dma_mcopy_pages(struct mm_struct *dst_mm,
+					      struct uffdio_dma_copy *uffdio_dma_copy,
+					      bool *mmap_changing)
+{
+	struct vm_area_struct *dst_vma;
+	ssize_t err;
+	long copied = 0;
+	bool wp_copy;
+	u64 src_start;
+	u64 dst_start;
+    u64 src_cur;
+    u64 dst_cur;
+	dma_addr_t src_phys;
+	dma_addr_t dst_phys;
+	u64 len;
+    u64 len_cur;
+	struct dma_chan *chan = NULL;
+	dma_cap_mask_t mask;
+	struct dma_async_tx_descriptor *tx = NULL;
+	dma_cookie_t dma_cookie;
+	struct dma_device *dma;
+	struct device *dev;
+	struct mm_struct *mm = current->mm;
+	int present;
+    int index = 0;
+	u64 count = 0;
+    u64 expect_count = 0;
+    static u64 dma_assign_index = 0;
+	struct tx_dma_param tx_dma_param;
+    u64 dma_len = 0;
+    u64 start, end;
+    u64 start_walk, end_walk;
+    u64 start_copy, end_copy;
+
+    #ifdef DEBUG_TM
+    start = rdtsc();
+    #endif
+	down_read(&dst_mm->mmap_sem);
+    /*
+	 * If memory mappings are changing because of non-cooperative
+	 * operation (e.g. mremap) running in parallel, bail out and
+	 * request the user to retry later
+	 */
+	err = -EAGAIN;
+	if (mmap_changing && READ_ONCE(*mmap_changing))
+		goto out_unlock;
+
+	BUG_ON(uffdio_dma_copy == NULL);
+	count = uffdio_dma_copy->count;
+    for (index = 0; index < count; index++) {
+        if (uffdio_dma_copy->len[index] % size_per_dma_request == 0) {
+            expect_count += uffdio_dma_copy->len[index] / size_per_dma_request;
+        }
+        else {
+            expect_count += uffdio_dma_copy->len[index] / size_per_dma_request + 1;
+        }
+    }
+
+	tx_dma_param.wakeup_count = 0;
+	tx_dma_param.expect_count = expect_count;
+    mutex_init(&(tx_dma_param.tx_dma_mutex));
+        
+    for (index  = 0; index < count; index++) {
+		dst_start = uffdio_dma_copy->dst[index];
+		src_start = uffdio_dma_copy->src[index];
+		len = uffdio_dma_copy->len[index];
+
+		/*
+		 * Sanitize the command parameters:
+		 */
+		BUG_ON(dst_start & ~PAGE_MASK);
+		BUG_ON(len & ~PAGE_MASK);
+
+		/* Does the address range wrap, or is the span zero-sized? */
+		BUG_ON(src_start + len <= src_start);
+		BUG_ON(dst_start + len <= dst_start);
+
+        #ifdef DEBUG_TM
+        start_walk = rdtsc();
+        #endif
+        page_walk(src_start, &src_phys);
+        page_walk(dst_start, &dst_phys);
+        #ifdef DEBUG_TM
+        end_walk = rdtsc();
+        start_copy = rdtsc();
+        #endif
+        for (src_cur = src_start, dst_cur = dst_start, len_cur = 0; len_cur < len;) {
+            err = 0;
+		    chan = chans[dma_assign_index++ % dma_channs];
+            if (len_cur + size_per_dma_request > len) {
+                dma_len = len - len_cur; 
+            }
+            else {
+                dma_len = size_per_dma_request;
+            }
+
+            tx = dmaengine_prep_dma_memcpy(chan, dst_phys, src_phys, dma_len, DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
+            if (tx == NULL) {
+                printk("wei: error when dmaengine_prep_dma_memcpy, dma_chans=%d\n", dma_channs);
+                goto out_unlock;
+            }
+
+            tx->callback = hemem_dma_tx_callback;
+            tx->callback_param = &tx_dma_param;
+            tx->cookie = chan->cookie;
+            dma_cookie = dmaengine_submit(tx);
+            if (dma_submit_error(dma_cookie)) {
+                printk("wei: Failed to do DMA tx_submit\n");
+                goto out_unlock;
+            }
+
+            dma_async_issue_pending(chan);
+            len_cur += dma_len;
+            src_cur += dma_len;
+            dst_cur += dma_len;
+            src_phys += dma_len;
+            dst_phys += dma_len;
+        }
+	}
+
+	wait_event_interruptible(wq, tx_dma_param.wakeup_count >= tx_dma_param.expect_count);
+    #ifdef DEBUG_TM
+    end_copy = rdtsc();
+    #endif
+	for (index = 0; index < count; index++) {
+		copied += uffdio_dma_copy->len[index];
+	}
+
+out_unlock:
+	up_read(&dst_mm->mmap_sem);
+out:
+   	BUG_ON(copied < 0);
+	BUG_ON(err > 0);
+	BUG_ON(!copied && !err);
+    #ifdef DEBUG_TM
+    end = rdtsc();
+    printk("dma_memcpy_fun: %llu, page_walk: %llu, only_dma_op:%llu\n", end - start, end_copy - start_copy, end_walk - start_walk);
+    #endif
+	return copied ? copied : err;
+}
+
 ssize_t mcopy_atomic(struct mm_struct *dst_mm, unsigned long dst_start,
 		     unsigned long src_start, unsigned long len,
 		     bool *mmap_changing, __u64 mode)
 {
 	return __mcopy_atomic(dst_mm, dst_start, src_start, len, false,
 			      mmap_changing, mode);
+}
+
+ssize_t dma_mcopy_pages(struct mm_struct *dst_mm,
+		     struct uffdio_dma_copy *uffdio_dma_copy,
+		     bool *mmap_changing)
+{
+	return __dma_mcopy_pages(dst_mm, 
+			      uffdio_dma_copy,
+			      mmap_changing);
 }
 
 ssize_t mfill_zeropage(struct mm_struct *dst_mm, unsigned long start,
@@ -673,18 +1016,25 @@ int mwriteprotect_range(struct mm_struct *dst_mm, unsigned long start,
 	 * Make sure the vma is not shared, that the dst range is
 	 * both valid and fully within a single existing vma.
 	 */
-	if (!dst_vma || (dst_vma->vm_flags & VM_SHARED))
+	if (!dst_vma || ((dst_vma->vm_flags & VM_SHARED) && !vma_is_dax(dst_vma))) {
+		printk("mm/userfaultfd.c: mwriteprotect_range: dst_vma is null\n");
 		goto out_unlock;
-	if (!userfaultfd_wp(dst_vma))
+	}
+	if (!userfaultfd_wp(dst_vma)) {
+		printk("mm/userfaultfd.c: mwriteprotect_range: dst_vma is not userfaultfd_wp\n");
 		goto out_unlock;
-	if (!vma_is_anonymous(dst_vma))
+	}
+	if (!(vma_is_anonymous(dst_vma) || vma_is_dax(dst_vma))) {
+		printk("mm/userfaultfd.c: mwriteprotect_range: dst_vma is not anonymous or dax\n");
 		goto out_unlock;
+	}
 
 	if (enable_wp)
 		newprot = vm_get_page_prot(dst_vma->vm_flags & ~(VM_WRITE));
 	else
 		newprot = vm_get_page_prot(dst_vma->vm_flags);
 
+	//printk("mm/userfaultfd.c: mwriteprotect_range: changing protection: enable_wp: [%d] is vm hugetlb_page: [%d]\n", enable_wp, is_vm_hugetlb_page(dst_vma));
 	change_protection(dst_vma, start, start + len, newprot,
 			  enable_wp ? MM_CP_UFFD_WP : MM_CP_UFFD_WP_RESOLVE);
 

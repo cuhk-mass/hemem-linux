@@ -93,6 +93,11 @@ struct userfaultfd_wake_range {
 	unsigned long len;
 };
 
+struct userfaultfd_tlbflush_range {
+	unsigned long start;
+	unsigned long len;
+};
+
 static int userfaultfd_wake_function(wait_queue_entry_t *wq, unsigned mode,
 				     int wake_flags, void *key)
 {
@@ -477,7 +482,12 @@ vm_fault_t handle_userfault(struct vm_fault *vmf, unsigned long reason)
 	set_current_state(blocking_state);
 	spin_unlock(&ctx->fault_pending_wqh.lock);
 
-	if (!is_vm_hugetlb_page(vmf->vma))
+	if (vma_is_dax(vmf->vma)) {
+		must_wait = userfaultfd_huge_must_wait(ctx, vmf->vma,
+						       vmf->address,
+						       vmf->flags, reason);
+	}
+	else if (!is_vm_hugetlb_page(vmf->vma)) {
 		must_wait = userfaultfd_must_wait(ctx, vmf->address, vmf->flags,
 						  reason);
 	else
@@ -551,6 +561,8 @@ vm_fault_t handle_userfault(struct vm_fault *vmf, unsigned long reason)
 out:
 	return ret;
 }
+
+EXPORT_SYMBOL(handle_userfault);
 
 static void userfaultfd_event_wait_completion(struct userfaultfd_ctx *ctx,
 					      struct userfaultfd_wait_queue *ewq)
@@ -1260,7 +1272,7 @@ static inline bool vma_can_userfault(struct vm_area_struct *vma,
 				     unsigned long vm_flags)
 {
 	/* FIXME: add WP support to hugetlbfs and shmem */
-	return vma_is_anonymous(vma) ||
+	return vma_is_anonymous(vma) || vma_is_dax(vma) ||
 		((is_vm_hugetlb_page(vma) || vma_is_shmem(vma)) &&
 		 !(vm_flags & VM_UFFD_WP));
 }
@@ -1419,7 +1431,8 @@ static int userfaultfd_register(struct userfaultfd_ctx *ctx,
 			start = vma->vm_start;
 		vma_end = min(end, vma->vm_end);
 
-		new_flags = (vma->vm_flags & ~vm_flags) | vm_flags;
+		new_flags = (vma->vm_flags & 
+                 ~(VM_UFFD_MISSING|VM_UFFD_WP)) | vm_flags;
 		prev = vma_merge(mm, prev, start, vma_end, new_flags,
 				 vma->anon_vma, vma->vm_file, vma->vm_pgoff,
 				 vma_policy(vma),
@@ -1821,6 +1834,344 @@ static int userfaultfd_writeprotect(struct userfaultfd_ctx *ctx,
 	return ret;
 }
 
+static int userfaultfd_tlbflush(struct userfaultfd_ctx *ctx,
+	       			unsigned long arg)
+{
+	int ret;
+/*struct uffdio_range uffdio_tlbflush;
+	struct userfaultfd_tlbflush_range range;
+	const void __user *buf = (void __user *)arg;
+
+	ret = -EFAULT;
+	if (copy_from_user(&uffdio_tlbflush, buf, sizeof(uffdio_tlbflush)))
+		goto out;
+
+	ret = validate_range(ctx->mm, uffdio_tlbflush.start, uffdio_tlbflush.len);
+	if (ret)
+		goto out;
+
+	range.start = uffdio_tlbflush.start;
+	range.len = uffdio_tlbflush.len;
+
+	VM_BUG_ON(!range.len);
+*/
+	flush_tlb_mm(ctx->mm);
+	ret = 0;
+	
+out:
+	return ret;
+}
+
+static int userfaultfd_cr3(struct userfaultfd_ctx *ctx,
+              unsigned long arg)
+{
+  int ret;
+  struct uffdio_cr3 uffdio_cr3;
+  struct uffdio_cr3 __user *user_uffdio_cr3;
+
+  user_uffdio_cr3 = (struct uffdio_cr3 __user *)arg;
+
+  ret = -EFAULT;
+  if (copy_from_user(&uffdio_cr3, user_uffdio_cr3, sizeof(uffdio_cr3)))
+    goto out;
+
+  if (put_user(read_cr3_pa(), &user_uffdio_cr3->cr3)) {
+    ret = -EFAULT;
+    goto out;
+  }
+
+  ret = 0;
+
+out:
+  return ret;
+}
+
+static int userfaultfd_bad_address(void *p)
+{
+  unsigned long dummy;
+  return probe_kernel_address((unsigned long *)p, dummy);
+}
+
+static int userfaultfd_get_flag(struct userfaultfd_ctx *ctx,
+                     unsigned long arg)
+{
+  int ret1 = -1, ret2 = 0;
+  unsigned long address;
+  unsigned long flag1, flag2;
+  struct uffdio_page_flags uffdio_page_flags;
+  struct uffdio_page_flags __user *user_uffdio_page_flags;
+	pgd_t *base = __va(read_cr3_pa());
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+
+  user_uffdio_page_flags = (struct uffdio_page_flags __user *)arg;
+
+  if (copy_from_user(&uffdio_page_flags, user_uffdio_page_flags, sizeof(uffdio_page_flags))) {
+    printk("fs/userfaultfd.c: userfaultfd_get_flag: copy_from_user failed\n");
+    goto out;
+  }
+
+  address = uffdio_page_flags.va;
+  flag1 = uffdio_page_flags.flag1;
+  flag2 = uffdio_page_flags.flag2;
+
+  pgd = base + pgd_index(address);
+	if (userfaultfd_bad_address(pgd))
+		goto bad;
+
+	if (!pgd_present(*pgd)) {
+    ret1 = 0;
+		goto out;
+  }
+
+	p4d = p4d_offset(pgd, address);
+	if (userfaultfd_bad_address(p4d))
+		goto bad;
+
+	if (!p4d_present(*p4d) || p4d_large(*p4d)) {
+    ret1 = 0;
+		goto out;
+  }
+
+	pud = pud_offset(p4d, address);
+	if (userfaultfd_bad_address(pud))
+		goto bad;
+
+	if (!pud_present(*pud) || pud_large(*pud)) {
+    ret1 = 0;
+		goto out;
+  }
+
+	pmd = pmd_offset(pud, address);
+	if (userfaultfd_bad_address(pmd))
+		goto bad;
+
+	if (!pmd_present(*pmd)) {
+    ret1 = 0;
+		goto out;
+  }
+
+  if (pmd_large(*pmd)) {
+    ret1 = pmd_flags(*pmd) & flag1;
+    ret2 = pmd_flags(*pmd) & flag2;
+    goto out;
+  }
+
+	pte = pte_offset_kernel(pmd, address);
+	if (userfaultfd_bad_address(pte))
+		goto bad;
+
+  ret1 = pte_flags(*pte) & flag1;
+  ret2 = pte_flags(*pte) & flag2;
+
+out:
+  if (put_user(ret1, &user_uffdio_page_flags->res1)) {
+    return -1;
+  }
+  if (put_user(ret2, &user_uffdio_page_flags->res2)) {
+    return -1;
+  }
+	return 0;
+bad:
+  return -1;
+}
+
+static int userfaultfd_clear_flag(struct userfaultfd_ctx *ctx,
+                                unsigned long arg)
+{
+  int ret = -1;
+  unsigned long address;
+  unsigned long flag1, flag2;
+  struct uffdio_page_flags uffdio_page_flags;
+  struct uffdio_page_flags __user *user_uffdio_page_flags;
+	pgd_t *base = __va(read_cr3_pa());
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+
+  user_uffdio_page_flags = (struct uffdio_page_flags __user *)arg;
+
+  if (copy_from_user(&uffdio_page_flags, user_uffdio_page_flags, sizeof(uffdio_page_flags))) {
+    printk("fs/userfaultfd.c: userfaultfd_get_flag: copy_from_user failed\n");
+    goto bad;
+  }
+
+  address = uffdio_page_flags.va;
+  flag1 = uffdio_page_flags.flag1;
+  flag2 = uffdio_page_flags.flag2;
+
+  pgd = base + pgd_index(address);
+	if (userfaultfd_bad_address(pgd))
+		goto bad;
+
+	if (!pgd_present(*pgd)) {
+    ret = 0;
+		goto out;
+  }
+
+	p4d = p4d_offset(pgd, address);
+	if (userfaultfd_bad_address(p4d))
+		goto bad;
+
+	if (!p4d_present(*p4d) || p4d_large(*p4d)) {
+    ret = 0;
+		goto out;
+  }
+
+	pud = pud_offset(p4d, address);
+	if (userfaultfd_bad_address(pud))
+		goto bad;
+
+	if (!pud_present(*pud) || pud_large(*pud)) {
+    ret = 0;
+		goto out;
+  }
+
+	pmd = pmd_offset(pud, address);
+	if (userfaultfd_bad_address(pmd))
+		goto bad;
+
+	if (!pmd_present(*pmd)) {
+		ret = 0;
+    goto out;
+  }
+
+  if (pmd_large(*pmd)) {
+    *pmd = pmd_clear_flags(*pmd, flag1 | flag2);
+    ret = 1;
+    goto out;
+  }
+
+	pte = pte_offset_kernel(pmd, address);
+	if (userfaultfd_bad_address(pte))
+		goto bad;
+
+  *pte = pte_clear_flags(*pte, flag1 | flag2);
+  ret = 1;
+
+out:
+  if (put_user(ret, &user_uffdio_page_flags->res1)) {
+    return -1;
+  }
+	return 0;
+bad:
+  return -1;
+}
+
+static int userfaultfd_dma_copy(struct userfaultfd_ctx *ctx,
+                    unsigned long arg)
+{
+    __s64 ret;
+    struct uffdio_dma_copy uffdio_dma_copy;
+    struct uffdio_dma_copy __user *user_uffdio_dma_copy;
+    struct userfaultfd_wake_range range;
+    int index;
+    u64 expected_len = 0;
+
+    u64 start_ioctl, end_ioctl;
+    u64 start_copy, end_copy;
+    #ifdef DEBUG_TM
+    start_ioctl = rdtsc();
+    #endif
+
+    user_uffdio_dma_copy = (struct uffdio_dma_copy __user *) arg;
+  
+    #ifdef NO_OPT  
+    ret = -EAGAIN;
+    if (READ_ONCE(ctx->mmap_changing))
+        goto out;
+    #endif
+
+    #ifdef DEBUG_TM
+    start_copy = rdtsc();
+    #endif
+    ret = -EFAULT;
+    if (copy_from_user(&uffdio_dma_copy, user_uffdio_dma_copy,
+               /* don't copy "copy" last field */
+	       sizeof(uffdio_dma_copy)-sizeof(__s64)))
+        goto out;
+    #ifdef DEBUG_TM
+    end_copy = rdtsc();
+    #endif
+
+    u64 count = uffdio_dma_copy.count;
+ 
+    #ifdef NO_OPT 
+    for (index = 0; index < count; index++)  {
+        ret = validate_range(ctx->mm, uffdio_dma_copy.dst[index], uffdio_dma_copy.len[index]);
+        if (ret)
+            goto out;
+	    expected_len += uffdio_dma_copy.len[index];
+    }
+    #endif
+
+    /*
+     * double check for wraparound just in case. copy_from_user()
+     * will later check uffdio_copy.src + uffdio_copy.len to fit
+     * in the userland range.
+     */
+    ret = -EINVAL;
+    if (mmget_not_zero(ctx->mm)) {
+        ret = dma_mcopy_pages(ctx->mm, &uffdio_dma_copy, &ctx->mmap_changing);
+        mmput(ctx->mm);
+    } else {
+        return -ESRCH;
+    }
+    if (unlikely(put_user(ret, &user_uffdio_dma_copy->copy)))
+        return -EFAULT;
+    if (ret < 0)
+        goto out;
+    BUG_ON(!ret);
+    /* len == 0 would wake all */
+    range.len = ret;
+
+    #if 0
+    if (!(uffdio_dma_copy.mode & UFFDIO_COPY_MODE_DONTWAKE)) {
+        range.start = uffdio_dma_copy.dst;
+        wake_userfault(ctx, &range);
+    }
+    #endif
+
+    ret = 0;
+    #ifdef NO_OPT
+    ret = ((range.len == expected_len) ? 0 : -EAGAIN);
+    #endif
+out:
+    #ifdef DEBUG_TM
+    end_ioctl = rdtsc();
+    //printk("userfaultfd_dma_ioctl:%llu, user-kernel copy:%llu\n", end_ioctl - start_ioctl, end_copy - start_copy);
+    printk("userfaultfd_dma_ioctl:%llu\n", end_ioctl - start_ioctl);
+    #endif
+    return ret;
+}
+
+// The design is only hemem case. Only one application can request/repsonse/use channels. Not consider concurrency and No lock for protection
+static int userfaultfd_dma_request_channs(struct userfaultfd_ctx *ctx,
+                     unsigned long arg)
+{
+    struct uffdio_dma_channs uffdio_dma_channs;
+    struct uffdio_dma_channs __user *user_uffdio_dma_channs;
+
+    user_uffdio_dma_channs = (struct uffdio_dma_channs __user *)arg;
+    if (copy_from_user(&uffdio_dma_channs, user_uffdio_dma_channs, sizeof(uffdio_dma_channs))) {
+        printk("fs/userfaultfd.c: userfaultfd_dma_request_channs: copy_from_user failed\n");
+        return -1;
+    }
+
+    return dma_request_channs(&uffdio_dma_channs);
+}
+
+static int userfaultfd_dma_release_channs(struct userfaultfd_ctx *ctx,
+                     unsigned long arg)
+{
+    return dma_release_channs();
+}
+
 static inline unsigned int uffd_ctx_features(__u64 user_features)
 {
 	/*
@@ -1901,6 +2252,27 @@ static long userfaultfd_ioctl(struct file *file, unsigned cmd,
 	case UFFDIO_WRITEPROTECT:
 		ret = userfaultfd_writeprotect(ctx, arg);
 		break;
+	case UFFDIO_TLBFLUSH:
+		ret = userfaultfd_tlbflush(ctx, arg);
+		break;
+  case UFFDIO_CR3:
+    ret = userfaultfd_cr3(ctx, arg);
+    break;
+  case UFFDIO_GET_FLAG:
+    ret = userfaultfd_get_flag(ctx, arg);
+    break;
+  case UFFDIO_CLEAR_FLAG:
+    ret = userfaultfd_clear_flag(ctx, arg);
+    break;
+    case UFFDIO_DMA_COPY:
+		ret = userfaultfd_dma_copy(ctx, arg);
+		break;
+    case UFFDIO_DMA_REQUEST_CHANNS:
+        ret = userfaultfd_dma_request_channs(ctx, arg);
+        break;
+    case UFFDIO_DMA_RELEASE_CHANNS:
+        ret = userfaultfd_dma_release_channs(ctx, arg);
+        break;
 	}
 	return ret;
 }

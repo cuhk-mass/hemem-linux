@@ -11,6 +11,7 @@
 #include <linux/fs.h>
 #include <linux/mm.h>
 #include <linux/mman.h>
+#include <linux/userfaultfd_k.h>
 #include "dax-private.h"
 #include "bus.h"
 
@@ -51,7 +52,7 @@ static int check_vma(struct dev_dax *dev_dax, struct vm_area_struct *vma,
 {
 	struct dax_region *dax_region = dev_dax->region;
 	struct device *dev = &dev_dax->dev;
-	unsigned long mask;
+	unsigned long mask, mask2;
 
 	if (!dax_alive(dev_dax->dax_dev))
 		return -ENXIO;
@@ -65,7 +66,8 @@ static int check_vma(struct dev_dax *dev_dax, struct vm_area_struct *vma,
 	}
 
 	mask = dax_region->align - 1;
-	if (vma->vm_start & mask || vma->vm_end & mask) {
+	mask2 = (unsigned int)4096 - 1;
+	if ((vma->vm_start & mask || vma->vm_end & mask) && (vma->vm_start & mask2 || vma->vm_end & mask2)) {
 		dev_info_ratelimited(dev,
 				"%s: %s: fail, unaligned vma (%#lx - %#lx, %#lx)\n",
 				current->comm, func, vma->vm_start, vma->vm_end,
@@ -114,19 +116,25 @@ static vm_fault_t __dev_dax_pte_fault(struct dev_dax *dev_dax,
 	struct dax_region *dax_region;
 	phys_addr_t phys;
 	unsigned int fault_size = PAGE_SIZE;
+	struct vm_area_struct *vma = vmf->vma;
 
 	if (check_vma(dev_dax, vmf->vma, __func__))
 		return VM_FAULT_SIGBUS;
 
 	dax_region = dev_dax->region;
+/*
 	if (dax_region->align > PAGE_SIZE) {
 		dev_dbg(dev, "alignment (%#x) > fault size (%#x)\n",
 			dax_region->align, fault_size);
-		return VM_FAULT_SIGBUS;
+		//return VM_FAULT_SIGBUS;
 	}
 
 	if (fault_size != dax_region->align)
-		return VM_FAULT_SIGBUS;
+		//return VM_FAULT_SIGBUS;
+*/
+    if (vma && userfaultfd_missing(vma)) {
+		return handle_userfault(vmf, VM_UFFD_MISSING);
+	}
 
 	phys = dax_pgoff_to_phys(dev_dax, vmf->pgoff, PAGE_SIZE);
 	if (phys == -1) {
@@ -148,6 +156,7 @@ static vm_fault_t __dev_dax_pmd_fault(struct dev_dax *dev_dax,
 	phys_addr_t phys;
 	pgoff_t pgoff;
 	unsigned int fault_size = PMD_SIZE;
+	struct vm_area_struct *vma = vmf->vma;
 
 	if (check_vma(dev_dax, vmf->vma, __func__))
 		return VM_FAULT_SIGBUS;
@@ -175,6 +184,10 @@ static vm_fault_t __dev_dax_pmd_fault(struct dev_dax *dev_dax,
 			(pmd_addr + PMD_SIZE) > vmf->vma->vm_end)
 		return VM_FAULT_SIGBUS;
 
+    if (vma && userfaultfd_missing(vma)) {
+        return handle_userfault(vmf, VM_UFFD_MISSING);
+	}
+
 	pgoff = linear_page_index(vmf->vma, pmd_addr);
 	phys = dax_pgoff_to_phys(dev_dax, pgoff, PMD_SIZE);
 	if (phys == -1) {
@@ -184,8 +197,7 @@ static vm_fault_t __dev_dax_pmd_fault(struct dev_dax *dev_dax,
 
 	*pfn = phys_to_pfn_t(phys, dax_region->pfn_flags);
 
-	return vmf_insert_pfn_pmd(vmf->vma, vmf->address, vmf->pmd, *pfn,
-			vmf->flags & FAULT_FLAG_WRITE);
+  return vmf_insert_pfn_pmd(vmf, *pfn, vmf->flags & FAULT_FLAG_WRITE);
 }
 
 #ifdef CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD
@@ -198,6 +210,7 @@ static vm_fault_t __dev_dax_pud_fault(struct dev_dax *dev_dax,
 	phys_addr_t phys;
 	pgoff_t pgoff;
 	unsigned int fault_size = PUD_SIZE;
+	struct vm_area_struct *vma = vmf->vma;
 
 
 	if (check_vma(dev_dax, vmf->vma, __func__))
@@ -226,6 +239,9 @@ static vm_fault_t __dev_dax_pud_fault(struct dev_dax *dev_dax,
 			(pud_addr + PUD_SIZE) > vmf->vma->vm_end)
 		return VM_FAULT_SIGBUS;
 
+    if (vma && userfaultfd_missing(vma)) {
+		return handle_userfault(vmf, VM_UFFD_MISSING);
+	}
 	pgoff = linear_page_index(vmf->vma, pud_addr);
 	phys = dax_pgoff_to_phys(dev_dax, pgoff, PUD_SIZE);
 	if (phys == -1) {
@@ -235,8 +251,7 @@ static vm_fault_t __dev_dax_pud_fault(struct dev_dax *dev_dax,
 
 	*pfn = phys_to_pfn_t(phys, dax_region->pfn_flags);
 
-	return vmf_insert_pfn_pud(vmf->vma, vmf->address, vmf->pud, *pfn,
-			vmf->flags & FAULT_FLAG_WRITE);
+  return vmf_insert_pfn_pud(vmf, *pfn, vmf->flags & FAULT_FLAG_WRITE);
 }
 #else
 static vm_fault_t __dev_dax_pud_fault(struct dev_dax *dev_dax,
@@ -316,8 +331,9 @@ static int dev_dax_split(struct vm_area_struct *vma, unsigned long addr)
 	struct dev_dax *dev_dax = filp->private_data;
 	struct dax_region *dax_region = dev_dax->region;
 
-	if (!IS_ALIGNED(addr, dax_region->align))
+	if (!(IS_ALIGNED(addr, dax_region->align) || IS_ALIGNED(addr, (unsigned int)4096))) {
 		return -EINVAL;
+	}
 	return 0;
 }
 
